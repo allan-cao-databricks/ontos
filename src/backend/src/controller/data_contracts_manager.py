@@ -394,13 +394,24 @@ class DataContractsManager(DeliveryMixin, SearchableAsset):
                 logger.debug(f"Could not load unified tags for contract {contract_id}: {tag_err}")
 
         owner = ""
-        domain = ""
+
+        # Index every assigned domain NAME so domain-keyed search matches by any of the
+        # contract's domains (primary or additional) — issue #520 story 14.
+        primary_domain = ""
+        try:
+            assigned = entity_domain_repo.get_domains_for_entity(
+                db, entity_type="data_contract", entity_id=str(contract_id)
+            )
+            primary_domain = next((d.domain_name for d in assigned if d.is_primary), "") or ""
+            tag_names = tag_names + [d.domain_name for d in assigned if d.domain_name]
+        except Exception as dom_err:
+            logger.debug(f"Could not load domains for contract {contract_id} search index: {dom_err}")
 
         extra_data = {
             "version": str(version) if version else "",
             "status": str(status) if status else "",
             "owner": owner,
-            "domain": domain,
+            "domain": primary_domain,
         }
 
         return SearchIndexItem(
@@ -5984,6 +5995,7 @@ class DataContractsManager(DeliveryMixin, SearchableAsset):
         is_admin=False,
         latest_only=True,
         *,
+        domain_ids=None,
         caller_email: Optional[str] = None,
         caller_team_ids: Optional[Set[str]] = None,
     ):
@@ -6003,10 +6015,13 @@ class DataContractsManager(DeliveryMixin, SearchableAsset):
             is_visible_consumer,
         )
 
-        if domain_id:
+        wanted_domain_ids = list(domain_ids or [])
+        if domain_id and domain_id not in wanted_domain_ids:
+            wanted_domain_ids.append(domain_id)
+        if wanted_domain_ids:
             # Any-of domain filter via the junction table (primary OR additional).
-            contract_ids = entity_domain_repo.find_entity_ids_by_domain(
-                db, domain_id=domain_id, entity_type="data_contract"
+            contract_ids = entity_domain_repo.find_entity_ids_by_domains(
+                db, domain_ids=wanted_domain_ids, entity_type="data_contract"
             )
             query = db.query(DataContractDb).filter(DataContractDb.id.in_(contract_ids or ["__none__"]))
             if not is_admin and project_id:
@@ -6073,6 +6088,7 @@ class DataContractsManager(DeliveryMixin, SearchableAsset):
         latest_only: bool = True,
         include_history: bool = False,
         *,
+        domain_ids: Optional[List[str]] = None,
         caller_email: Optional[str] = None,
         caller_team_ids: Optional[Set[str]] = None,
     ):
@@ -6091,6 +6107,7 @@ class DataContractsManager(DeliveryMixin, SearchableAsset):
             project_id,
             is_admin,
             latest_only,
+            domain_ids=domain_ids,
             caller_email=caller_email,
             caller_team_ids=caller_team_ids,
         )
