@@ -2,9 +2,10 @@ name: Test Coverage
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, development]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, development]
+  merge_group:
 
 permissions:
   id-token: write
