@@ -8,6 +8,7 @@ environments:
         - "databricks-sdk>=0.81.0"
         - "sqlalchemy"
         - "psycopg2-binary"
+        - "pyyaml"
 tasks:
   - task_key: "data_quality_checks"
     spark_python_task:

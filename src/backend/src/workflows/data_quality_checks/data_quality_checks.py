@@ -417,6 +417,87 @@ def evaluate_regex_patterns(df: DataFrame, specs: List[Tuple[str, str]]) -> List
     return results
 
 
+
+def load_quality_rules(engine: Engine, object_id: str) -> List[Dict[str, Any]]:
+    """Load accepted contract-level quality rules (Quality Rules card) for a schema object."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT q.name AS rule_name, q.rule AS rule_expr, q.dimension, q.severity,
+                   p.name AS column_name, q.must_be, q.must_be_between_min, q.must_be_between_max
+            FROM data_contract_quality_checks q
+            LEFT JOIN data_contract_schema_properties p ON q.property_id = p.id
+            WHERE q.object_id = :oid
+        """), {"oid": object_id}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def evaluate_quality_rules(df: DataFrame, rules: List[Dict[str, Any]]) -> List[Tuple[str, Optional[str], bool, int, str]]:
+    """Evaluate Quality Rules against the dataframe.
+
+    Prefers the stored SQL expression (generic); falls back to name-based
+    evaluators. Returns (check_label, column, passed, violations, message).
+    Unsupported/unparameterized rules are skipped with a printed note.
+    """
+    out: List[Tuple[str, Optional[str], bool, int, str]] = []
+    for r in rules:
+        name = (r.get("rule_name") or "").strip()
+        col = r.get("column_name")
+        expr_txt = (r.get("rule_expr") or "").strip()
+        try:
+            if expr_txt:
+                violations = df.filter(~F.expr(expr_txt)).count()
+            elif name == "is_not_null" and col and column_exists(df, col):
+                violations = df.filter(F.col(col).isNull()).count()
+            elif name == "is_not_null_and_not_empty" and col and column_exists(df, col):
+                violations = df.filter(F.col(col).isNull() | (F.trim(F.col(col).cast("string")) == "")).count()
+            elif name == "is_unique" and col and column_exists(df, col):
+                violations = (df.groupBy(col).count().filter(F.col("count") > 1)).count()
+            elif name == "is_in_range" and col and column_exists(df, col) and (r.get("must_be_between_min") is not None or r.get("must_be_between_max") is not None):
+                cond = F.lit(False)
+                if r.get("must_be_between_min") is not None:
+                    cond = cond | (F.col(col) < float(r["must_be_between_min"]))
+                if r.get("must_be_between_max") is not None:
+                    cond = cond | (F.col(col) > float(r["must_be_between_max"]))
+                violations = df.filter(cond).count()
+            elif name == "is_in_list" and col and column_exists(df, col) and r.get("must_be"):
+                try:
+                    allowed = json.loads(r["must_be"]) if isinstance(r["must_be"], str) else r["must_be"]
+                except Exception:
+                    allowed = [v.strip() for v in str(r["must_be"]).split(",") if v.strip()]
+                if not isinstance(allowed, list) or not allowed:
+                    print(f"[RULE-SKIP] {name}({col}): unparseable allowed list")
+                    continue
+                violations = df.filter(~F.col(col).isin(allowed) & F.col(col).isNotNull()).count()
+            else:
+                print(f"[RULE-SKIP] {name}({col}): unsupported or missing parameters")
+                continue
+            passed = violations == 0
+            msg = f"rule {name}({col or expr_txt[:40]})={'OK' if passed else 'FAIL'} violations={violations}"
+            out.append((f"rule:{name}", col, passed, int(violations), msg))
+        except Exception as e:
+            print(f"[RULE-ERROR] {name}({col}): {e}")
+    return out
+
+
+def post_quality_item(engine: Engine, contract_id: str, score: float, passed: int, failed: int, failures: List[str]) -> None:
+    """Write the run summary straight into the Quality panel (quality_items)."""
+    total = passed + failed
+    desc = f"Contract validation run: {passed}/{total} checks passed."
+    if failures:
+        desc += " Failures: " + "; ".join(failures)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO quality_items (id, entity_type, entity_id, title, description, dimension,
+                                       source, score_percent, checks_passed, checks_total,
+                                       measured_at, created_by, created_at, updated_at)
+            VALUES (:id, 'data_contract', :cid, :title, :desc, 'completeness', 'dqx',
+                    :score, :passed, :total, NOW(), 'data_quality_checks-job', NOW(), NOW())
+        """), {"id": str(uuid4()), "cid": contract_id,
+               "title": f"Contract validation ({datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC)",
+               "desc": desc[:1900], "score": score, "passed": passed, "total": total})
+    print(f"[QUALITY-ITEM] posted {passed}/{total} ({score}%) to contract {contract_id}")
+
+
 def run_contract_checks(
     spark: SparkSession,
     engine: Engine,
@@ -434,6 +515,7 @@ def run_contract_checks(
 
     checks_passed = 0
     checks_failed = 0
+    run_failures: List[str] = []
 
     try:
         for schema_obj in schema_objs:
@@ -492,6 +574,7 @@ def run_contract_checks(
                     checks_passed += 1
                 else:
                     checks_failed += 1
+                    run_failures.append(f"{col_name} required: {nulls} nulls")
 
             # Unique
             for col_name, passed, dup_groups in evaluate_unique_columns(df, unique_cols):
@@ -502,6 +585,7 @@ def run_contract_checks(
                     checks_passed += 1
                 else:
                     checks_failed += 1
+                    run_failures.append(f"{col_name} unique: {dup_groups} duplicate groups")
 
             # Ranges
             for col_name, passed, violations in evaluate_numeric_ranges(df, range_specs):
@@ -512,6 +596,7 @@ def run_contract_checks(
                     checks_passed += 1
                 else:
                     checks_failed += 1
+                    run_failures.append(f"{col_name} range: {violations} violations")
 
             # Lengths
             for col_name, passed, violations in evaluate_string_lengths(df, length_specs):
@@ -522,6 +607,7 @@ def run_contract_checks(
                     checks_passed += 1
                 else:
                     checks_failed += 1
+                    run_failures.append(f"{col_name} length: {violations} violations")
 
             # Patterns
             for col_name, passed, violations in evaluate_regex_patterns(df, pattern_specs):
@@ -532,11 +618,33 @@ def run_contract_checks(
                     checks_passed += 1
                 else:
                     checks_failed += 1
+                    run_failures.append(f"{col_name} pattern: {violations} violations")
+
+            # Quality Rules (accepted DQX suggestions on the Quality Rules card)
+            obj_id = schema_obj.get("id")
+            if obj_id:
+                rules = load_quality_rules(engine, str(obj_id))
+                for check_label, col_name, passed, violations, msg in evaluate_quality_rules(df, rules):
+                    print(f"[DQ] {contract_name} | {qualified} -> {msg}")
+                    store_dq_result(engine, run_id, contract_id, qualified, check_label, col_name, passed, violations, msg)
+                    if passed:
+                        checks_passed += 1
+                    else:
+                        checks_failed += 1
+                    if not passed:
+                        run_failures.append(f"{col_name or check_label} {check_label}: {violations} violations")
 
         # Complete run
         total = max(1, checks_passed + checks_failed)
         score = round(100.0 * (checks_passed / total), 2)
         complete_dq_run(engine, run_id, checks_passed, checks_failed, score)
+
+        # Baked-in bridge: surface the run on the contract's Quality panel
+        if checks_passed + checks_failed > 0:
+            try:
+                post_quality_item(engine, contract_id, score, checks_passed, checks_failed, run_failures)
+            except Exception as e:
+                print(f"[QUALITY-ITEM-ERROR] {e}")
 
         return (checks_passed, checks_failed)
 
