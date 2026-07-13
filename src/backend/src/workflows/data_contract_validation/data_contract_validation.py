@@ -225,39 +225,7 @@ def complete_validation_run(
 # Contract Loading
 # ============================================================================
 
-def load_active_contracts_from_uc(
-    spark: SparkSession,
-    catalog: str,
-    schema: str,
-    statuses: List[str]
-) -> List[Dict[str, Any]]:
-    """Load active contracts and their schema/properties from UC-backed Lakehouse tables."""
-    cte = f"{catalog}.{schema}"
-
-    # Build status filter
-    status_list = "','".join(s.lower() for s in statuses)
-    status_filter = f"lower(c.status) IN ('{status_list}')"
-
-    df = spark.sql(
-        f"""
-        SELECT c.id AS contract_id,
-               c.name AS contract_name,
-               o.id AS object_id,
-               o.name AS object_name,
-               o.physical_name AS physical_name,
-               p.name AS prop_name,
-               p.logical_type AS prop_type
-        FROM {cte}.data_contracts c
-        JOIN {cte}.data_contract_schema_objects o
-          ON o.contract_id = c.id
-        LEFT JOIN {cte}.data_contract_schema_properties p
-          ON p.object_id = o.id
-        WHERE {status_filter}
-        """
-    )
-
-    # Group rows into contracts
-    rows = df.collect()
+def _group_contract_rows(rows) -> List[Dict[str, Any]]:
     contracts_by_id: Dict[str, Dict[str, Any]] = {}
 
     for r in rows:
@@ -300,6 +268,67 @@ def load_active_contracts_from_uc(
 
     return result
 
+
+
+def load_active_contracts_from_pg(engine: Engine, statuses: List[str]) -> List[Dict[str, Any]]:
+    """Load active contracts directly over the app database connection.
+
+    Fallback used when no federated UC catalog/schema is configured for the
+    app database — the workflow already holds an authenticated Postgres
+    engine, and the contract tables live there natively.
+    """
+    status_list = "','".join(s.lower() for s in statuses)
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT c.id AS contract_id,
+                   c.name AS contract_name,
+                   o.id AS object_id,
+                   o.name AS object_name,
+                   o.physical_name AS physical_name,
+                   p.name AS prop_name,
+                   p.logical_type AS prop_type
+            FROM data_contracts c
+            JOIN data_contract_schema_objects o ON o.contract_id = c.id
+            LEFT JOIN data_contract_schema_properties p ON p.object_id = o.id
+            WHERE lower(c.status) IN ('{status_list}')
+        """)).mappings().all()
+    return _group_contract_rows(rows)
+
+
+def load_active_contracts_from_uc(
+    spark: SparkSession,
+    catalog: str,
+    schema: str,
+    statuses: List[str]
+) -> List[Dict[str, Any]]:
+    """Load active contracts and their schema/properties from UC-backed Lakehouse tables."""
+    cte = f"{catalog}.{schema}"
+
+    # Build status filter
+    status_list = "','".join(s.lower() for s in statuses)
+    status_filter = f"lower(c.status) IN ('{status_list}')"
+
+    df = spark.sql(
+        f"""
+        SELECT c.id AS contract_id,
+               c.name AS contract_name,
+               o.id AS object_id,
+               o.name AS object_name,
+               o.physical_name AS physical_name,
+               p.name AS prop_name,
+               p.logical_type AS prop_type
+        FROM {cte}.data_contracts c
+        JOIN {cte}.data_contract_schema_objects o
+          ON o.contract_id = c.id
+        LEFT JOIN {cte}.data_contract_schema_properties p
+          ON p.object_id = o.id
+        WHERE {status_filter}
+        """
+    )
+
+    # Group rows into contracts
+    rows = df.collect()
+    return _group_contract_rows(rows)
 
 def qualify_uc_name(physical_name: str, default_catalog: Optional[str], default_schema: Optional[str]) -> Optional[str]:
     """Return a fully qualified UC table name catalog.schema.table if possible."""
@@ -607,9 +636,9 @@ def main() -> None:
     default_catalog = args.catalog or os.environ.get("DATABRICKS_CATALOG")
     default_schema = args.schema or os.environ.get("DATABRICKS_SCHEMA")
 
-    if not default_catalog or not default_schema:
-        print("Catalog/schema not provided; set --catalog/--schema or DATABRICKS_CATALOG/SCHEMA.")
-        return
+    use_pg_fallback = not default_catalog or not default_schema
+    if use_pg_fallback:
+        print("Catalog/schema not provided; will load contracts via the app database connection.")
 
     # Initialize workspace client
     print("\nInitializing workspace client...")
@@ -631,7 +660,10 @@ def main() -> None:
     # Load contracts
     print(f"\nLoading contracts with statuses: {contract_statuses}")
     try:
-        contracts = load_active_contracts_from_uc(spark, default_catalog, default_schema, contract_statuses)
+        if use_pg_fallback:
+            contracts = load_active_contracts_from_pg(engine, contract_statuses)
+        else:
+            contracts = load_active_contracts_from_uc(spark, default_catalog, default_schema, contract_statuses)
     except Exception as e:
         print(f"Failed loading contracts from UC: {e}")
         return
